@@ -1,0 +1,10 @@
+{
+  "name": "@nullstyle/usession",
+  "version": "0.0.1",
+  "exports": "./mod.ts",
+  "imports": {
+    "tweetnacl": "npm:tweetnacl@^1.0.3",
+    "hono": "jsr:@hono/hono@^4",
+    "@std/encoding": "jsr:@std/encoding@^1"
+  }
+}
