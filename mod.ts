@@ -1,40 +1,55 @@
 /**
  * @module usession
  *
- * Rails-like sealed cookie sessions for Deno + Hono
+ * Rails-like sealed cookie sessions for Deno.
+ * Web-framework agnostic (works with Hono, Fresh, etc).
  *
  * Uses TweetNaCl secretbox (XSalsa20-Poly1305) for authenticated encryption.
  * A single SESSION_SECRET environment variable is hashed (SHA-256) into a
  * 32-byte key for sealing/unsealing session payloads.
  *
- * @example Basic usage
+ * @example Hono Usage
  * ```ts
  * import { Hono } from "hono";
- * import { cookieSession, getSession } from "@nullstyle/usession";
+ * import { SessionManager } from "@nullstyle/usession";
  *
  * const app = new Hono();
- *
- * app.use("*", cookieSession({
+ * const sessions = new SessionManager({
  *   secret: Deno.env.get("SESSION_SECRET")!,
- *   cookieName: "__Host-session",
- *   ttlSeconds: 60 * 60 * 24 * 7,
- * }));
+ *   cookieName: "session",
+ * });
  *
- * app.get("/", (c) => {
- *   const session = getSession<{ uid?: string }>(c);
- *   if (session.get("uid")) {
- *     return c.text(`Hello, user ${session.get("uid")}`);
+ * app.use("*", async (c, next) => {
+ *   const session = await sessions.load(c.req.raw);
+ *   c.set("session", session);
+ *   await next();
+ *   const setCookie = await sessions.persist(session, c.req.raw);
+ *   if (setCookie) {
+ *     c.header("Set-Cookie", setCookie);
  *   }
- *   return c.text("Not logged in");
  * });
  * ```
  *
- * @example Hono typing hook
+ * @example Fresh Usage
  * ```ts
- * declare module "hono" {
- *   interface ContextVariableMap {
- *     session: import("@nullstyle/usession").ISession<MySessionData>;
+ * // routes/_middleware.ts
+ * import { FreshContext } from "$fresh/server.ts";
+ * import { SessionManager } from "@nullstyle/usession";
+ *
+ * const sessions = new SessionManager({
+ *   secret: Deno.env.get("SESSION_SECRET")!,
+ *   cookieName: "session",
+ * });
+ *
+ * export async function handler(req: Request, ctx: FreshContext) {
+ *   const session = await sessions.load(req);
+ *   ctx.state.session = session;
+ *   const resp = await ctx.next();
+ *   const setCookie = await sessions.persist(session, req);
+ *   if (setCookie) {
+ *     resp.headers.append("Set-Cookie", setCookie);
  *   }
+ *   return resp;
  * }
  * ```
  */
@@ -67,25 +82,15 @@ export {
   Session,
 } from "./session.ts";
 
-// Middleware
+// Manager
 export {
-  cookieSession,
-  getSession,
+  SessionManager,
   type SessionOptions,
-} from "./middleware.ts";
+} from "./manager.ts";
 
-// OIDC helpers
-export {
-  beginOidcLogin,
-  type BeginOidcLoginResult,
-  completeOidcLogin,
-  type CompleteOidcLoginParams,
-  getOidcReturnTo,
-  verifyOidcCallback,
-  type VerifyOidcCallbackResult,
-} from "./oidc.ts";
 
-// Re-export base64url utilities from @std/encoding (useful for CSRF tokens, etc.)
+
+// Re-export base64url utilities from @std/encoding
 export {
   decodeBase64Url,
   encodeBase64Url,

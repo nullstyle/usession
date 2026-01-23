@@ -8,20 +8,8 @@
 export type DefaultSessionData = {
   v?: number; // app schema version
   uid?: string; // internal user id
-  sub?: string; // OIDC subject
-  iss?: string; // OIDC issuer
-  claims?: {
-    email?: string;
-    name?: string;
-  };
   csrf?: string;
   flash?: Record<string, string>;
-  oidc?: {
-    state?: string;
-    nonce?: string;
-    pkceVerifier?: string;
-    returnTo?: string;
-  };
 };
 
 /**
@@ -31,6 +19,7 @@ export interface ISession<T extends Record<string, unknown>> {
   readonly data: T;
   readonly isNew: boolean;
   readonly isDirty: boolean;
+  readonly isInvalid: boolean;
   readonly isDestroyed: boolean;
 
   get<K extends keyof T>(key: K): T[K] | undefined;
@@ -54,15 +43,17 @@ export class Session<T extends Record<string, unknown>>
   private _data: T;
   private _isNew: boolean;
   private _isDirty: boolean;
+  private _isInvalid: boolean;
   private _isDestroyed: boolean;
 
   constructor(
     data: T,
-    opts: { isNew?: boolean } = {},
+    opts: { isNew?: boolean; isInvalid?: boolean } = {},
   ) {
     this._data = data;
     this._isNew = opts.isNew ?? false;
     this._isDirty = false;
+    this._isInvalid = opts.isInvalid ?? false;
     this._isDestroyed = false;
   }
 
@@ -76,6 +67,10 @@ export class Session<T extends Record<string, unknown>>
 
   get isDirty(): boolean {
     return this._isDirty;
+  }
+
+  get isInvalid(): boolean {
+    return this._isInvalid;
   }
 
   get isDestroyed(): boolean {

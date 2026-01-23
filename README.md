@@ -1,31 +1,65 @@
 # usession
 
-Rails-inspired sealed cookie sessions for Deno + Hono.
+Rails-inspired sealed cookie sessions for Deno.
+Web-framework agnostic (works with Hono, Fresh, etc).
 
 Sessions are stored entirely in an encrypted cookie using TweetNaCl's `secretbox` (XSalsa20-Poly1305). A single `SESSION_SECRET` environment variable is hashed into a 32-byte key for sealing/unsealing payloads.
 
 ## Installation
 
-```ts
-import { cookieSession, getSession } from "jsr:@nullstyle/usession";
+```bash
+deno add jsr:@nullstyle/usession
 ```
 
-## Quick Start
+```ts
+import { SessionManager } from "@nullstyle/usession";
+```
+
+## Usage with Hono
+
+Since `usession` is framework-agnostic, you create a middleware using `SessionManager` that adapts to Hono's API.
 
 ```ts
 import { Hono } from "jsr:@hono/hono";
-import { cookieSession, getSession } from "jsr:@nullstyle/usession";
+import { SessionManager, type ISession } from "jsr:@nullstyle/usession";
+
+// Define your session data shape
+type SessionData = {
+  uid?: string;
+};
+
+// Add type safety to Hono
+declare module "hono" {
+  interface ContextVariableMap {
+    session: ISession<SessionData>;
+  }
+}
 
 const app = new Hono();
 
-app.use("*", cookieSession({
+// Initialize the manager
+const sessions = new SessionManager<SessionData>({
   secret: Deno.env.get("SESSION_SECRET")!,
-  cookieName: "__Host-session",
+  cookieName: "session",
   ttlSeconds: 60 * 60 * 24 * 7, // 7 days
-}));
+});
 
+// Create middleware
+app.use("*", async (c, next) => {
+  const session = await sessions.load(c.req.raw);
+  c.set("session", session);
+
+  await next();
+
+  const setCookie = await sessions.persist(session, c.req.raw);
+  if (setCookie) {
+    c.header("Set-Cookie", setCookie);
+  }
+});
+
+// Use it in routes
 app.get("/", (c) => {
-  const session = getSession<{ uid?: string }>(c);
+  const session = c.get("session");
   if (session.get("uid")) {
     return c.text(`Hello, user ${session.get("uid")}`);
   }
@@ -33,24 +67,53 @@ app.get("/", (c) => {
 });
 
 app.post("/login", (c) => {
-  const session = getSession<{ uid?: string }>(c);
+  const session = c.get("session");
   session.set("uid", "user123");
   return c.text("Logged in");
 });
+```
 
-app.post("/logout", (c) => {
-  const session = getSession(c);
-  session.destroy();
-  return c.text("Logged out");
+## Usage with Deno Fresh
+
+In Fresh, you can use a middleware to attach the session to `ctx.state`.
+
+```ts
+// routes/_middleware.ts
+import { FreshContext } from "$fresh/server.ts";
+import { SessionManager, type ISession } from "jsr:@nullstyle/usession";
+
+type SessionData = {
+  uid?: string;
+};
+
+export interface State {
+  session: ISession<SessionData>;
+}
+
+const sessions = new SessionManager<SessionData>({
+  secret: Deno.env.get("SESSION_SECRET")!,
+  cookieName: "session",
 });
 
-Deno.serve(app.fetch);
+export async function handler(req: Request, ctx: FreshContext<State>) {
+  const session = await sessions.load(req);
+  ctx.state.session = session;
+
+  const resp = await ctx.next();
+
+  const setCookie = await sessions.persist(session, req);
+  if (setCookie) {
+    resp.headers.append("Set-Cookie", setCookie);
+  }
+
+  return resp;
+}
 ```
 
 ## Configuration
 
 ```ts
-cookieSession({
+const sessions = new SessionManager({
   // Required
   secret: string,           // From SESSION_SECRET env var (must be high entropy)
   cookieName: string,       // e.g. "__Host-session" (prod) or "session" (dev)
@@ -79,7 +142,7 @@ cookieSession({
 ## Session API
 
 ```ts
-const session = getSession<MySessionData>(c);
+const session = await sessions.load(req);
 
 // Read/write
 session.get("key");           // Get value
@@ -91,6 +154,7 @@ session.data;                 // Direct access to data object
 session.isNew;                // True if no valid cookie was found
 session.isDirty;              // True if any mutations occurred
 session.isDestroyed;          // True if destroy() was called
+session.isInvalid;            // True if cookie was present but invalid
 
 // Flash messages (one-time values)
 session.flash("notice", "Saved!");
@@ -101,105 +165,7 @@ session.destroy();            // Clear session, delete cookie
 session.touch();              // Mark dirty without changing data (for rolling)
 ```
 
-## TypeScript Support
 
-Extend Hono's context types for better autocomplete:
-
-```ts
-declare module "hono" {
-  interface ContextVariableMap {
-    session: import("@nullstyle/usession").ISession<{
-      uid?: string;
-      claims?: { email?: string; name?: string };
-    }>;
-  }
-}
-```
-
-## OIDC Helpers
-
-Built-in helpers for storing OIDC login state:
-
-```ts
-import {
-  beginOidcLogin,
-  verifyOidcCallback,
-  completeOidcLogin,
-  getOidcReturnTo,
-} from "jsr:@nullstyle/usession";
-
-// Start login - stores state/nonce/PKCE in session
-app.get("/auth/login", async (c) => {
-  const session = getSession(c);
-  const { state, nonce, pkceChallenge } = await beginOidcLogin(session, {
-    returnTo: c.req.query("returnTo"),
-  });
-
-  const url = new URL("https://provider.com/authorize");
-  url.searchParams.set("state", state);
-  url.searchParams.set("nonce", nonce);
-  url.searchParams.set("code_challenge", pkceChallenge);
-  url.searchParams.set("code_challenge_method", "S256");
-  // ... other OIDC params
-
-  return c.redirect(url.toString());
-});
-
-// Handle callback - verify state, complete login
-app.get("/auth/callback", async (c) => {
-  const session = getSession(c);
-  const state = c.req.query("state") ?? "";
-
-  const result = verifyOidcCallback(session, { state });
-  if (!result.ok) {
-    return c.text(result.error, 400);
-  }
-
-  // Use result.nonce and result.pkceVerifier with your OIDC library
-  const claims = await exchangeCodeForClaims(c.req.query("code"), {
-    nonce: result.nonce,
-    pkceVerifier: result.pkceVerifier,
-  });
-
-  completeOidcLogin(session, {
-    uid: claims.sub,
-    sub: claims.sub,
-    iss: claims.iss,
-    claims: { email: claims.email, name: claims.name },
-  });
-
-  return c.redirect(result.returnTo ?? "/");
-});
-```
-
-## Cap'n Web Integration
-
-Works with `@hono/capnweb` for authenticated RPC:
-
-```ts
-import { Hono } from "jsr:@hono/hono";
-import { upgradeWebSocket } from "jsr:@hono/hono/deno";
-import { newRpcResponse } from "jsr:@hono/capnweb";
-import { cookieSession, getSession } from "jsr:@nullstyle/usession";
-
-const app = new Hono();
-
-app.use("*", cookieSession({
-  secret: Deno.env.get("SESSION_SECRET")!,
-  cookieName: "__Host-session",
-}));
-
-app.all("/api", (c) => {
-  const session = getSession<{ uid?: string }>(c);
-  if (!session.get("uid")) {
-    return c.text("Unauthorized", 401);
-  }
-
-  return newRpcResponse(c, createApiServer({ uid: session.get("uid")! }), {
-    upgradeWebSocket,
-  });
-});
-```
 
 ## Security Notes
 
@@ -208,22 +174,6 @@ app.all("/api", (c) => {
 - **No server-side revocation** - Stateless cookies can't be revoked until expiry
 - **SameSite=Lax default** - Compatible with OIDC redirects while providing CSRF protection
 - **Use `__Host-` prefix in production** - Ensures Secure + host-only + path=/
-
-## Token Format
-
-```
-v1.<nonce_base64url>.<ciphertext_base64url>
-```
-
-The encrypted payload contains:
-```ts
-{
-  ctx: { v: 1, cookieName, purpose, host? },
-  iat: number,  // issued at (unix seconds)
-  exp?: number, // expiry (unix seconds)
-  data: T,      // your session data
-}
-```
 
 ## License
 
