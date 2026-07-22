@@ -1,6 +1,6 @@
 {
   "name": "@nullstyle/usession",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "description": "Rails-like sealed (encrypted) cookie sessions. Framework and runtime agnostic — needs only Web Crypto and the Fetch Request.",
   "exports": "./mod.ts",

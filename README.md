@@ -144,6 +144,8 @@ performs.
 | `bindHost`             | `boolean`                       | `false`     | Bind the session to the request host.                                        |
 | `trustProxy`           | `boolean`                       | `false`     | Trust `X-Forwarded-Proto` / `-Host`.                                         |
 | `onInvalidCookie`      | `"ignore" \| "clear"`           | `"clear"`   | Whether to delete a cookie that failed to unseal.                            |
+| `epochTracks`          | `EpochTrack[]`                  | `[]`        | Revocation tracks. See below.                                                |
+| `onEpochError`         | `(info) => "reject" \| "allow"` | —           | Policy when a track's resolver fails. Omit to fail closed.                   |
 | `cookie.path`          | `string`                        | `"/"`       |                                                                              |
 | `cookie.domain`        | `string`                        | —           | Omit for a host-only cookie.                                                 |
 | `cookie.httpOnly`      | `boolean`                       | `true`      |                                                                              |
@@ -286,6 +288,144 @@ browse.
 }
 ```
 
+## Revocation with epoch tracks
+
+A sealed cookie normally cannot be revoked: there is no server-side store to
+delete it from, so `destroy()` clears the browser's copy but not a copy an
+attacker captured. An **epoch track** closes that gap without giving up
+statelessness.
+
+A track stamps a number into the cookie when it is written and re-checks it when
+the cookie is read. Advance the number and every cookie stamped before it stops
+working — immediately, for every session on that track.
+
+Tracks are named and independent, so one session can be revoked along several
+axes at once:
+
+```ts
+import { appEpoch, SessionManager, userEpoch } from "@nullstyle/usession";
+
+type SessionData = { uid?: string; org?: string };
+
+// However you store them — a constant, a row, a Redis key.
+const getAppEpoch = (): Promise<number> => Promise.resolve(1);
+const getUserEpoch = (uid: string): Promise<number> => Promise.resolve(1);
+const getOrgEpoch = (org: string): Promise<number> => Promise.resolve(1);
+
+const sessions = new SessionManager<SessionData>({
+  secret: Deno.env.get("SESSION_SECRET")!,
+  cookieName: "__Host-session",
+  epochTracks: [
+    // Everyone at once — bump after a secret leak.
+    appEpoch(() => getAppEpoch()),
+
+    // One user at a time — bump on password change or "sign out everywhere".
+    userEpoch((data) => data.uid ?? null, (uid) => getUserEpoch(uid)),
+
+    // Anything else: a suspended tenant, a permission-model change, a device
+    // family, a session-schema version. A track is just an object.
+    {
+      name: "o",
+      key: (data: SessionData) => data.org ?? null,
+      current: (org) => getOrgEpoch(org!),
+    },
+  ],
+});
+```
+
+Revoking is then whatever "increment" means in your store — the library never
+reads or writes it:
+
+```ts ignore
+await db.users.update(uid, { sessionEpoch: Date.now() }); // signs uid out everywhere
+```
+
+Rules worth knowing:
+
+- An epoch is any **non-decreasing finite number** — a counter or a timestamp.
+  Rejection is `stored < current`, so a lagging read replica returning an older
+  value fails _open_ on that axis rather than logging everyone out.
+- `key()` returning `null` skips the track: an anonymous session has no user to
+  revoke, so a user track simply does not apply to it.
+- Rejected sessions expose the reason — `Epoch stale: u`, `Epoch missing: u`,
+  `Epoch unavailable: u` — through `session.invalidReason` and `onInvalid`.
+- Resolution happens **after** the cookie is authenticated, so a client planting
+  junk cookies cannot force lookups against your store.
+
+### When your epoch store is down
+
+By default a resolver that throws, or returns a non-number, **rejects** the
+session: the safe outcome is the one you get by accident. That does mean an
+outage in your store logs everyone out, so the policy is overridable:
+
+```ts
+import { appEpoch, SessionManager } from "@nullstyle/usession";
+
+const sessions = new SessionManager({
+  secret: Deno.env.get("SESSION_SECRET")!,
+  cookieName: "__Host-session",
+  epochTracks: [appEpoch(() => Promise.resolve(1))],
+  onEpochError: (info) => {
+    console.warn("epoch unavailable", info.track, info.error);
+    // Available, but revocation is off until the store recovers.
+    return "allow";
+  },
+});
+```
+
+`"allow"` skips that one track for that one request. Throwing from the callback
+propagates out of `load()` if you would rather fail the request loudly.
+
+An existing session keeps working through the outage: the stamp it arrived with
+is carried forward, so even `rolling: true` re-seals preserve it and the session
+is still valid once the store recovers.
+
+A **new** identity is the exception. Logging in mid-outage has no prior stamp to
+preserve, so `persist()` throws rather than mint an unstamped cookie — that
+cookie would be rejected on the very next request, logging the user out silently
+instead. You cannot mint a session you cannot stamp.
+
+### Caching resolvers
+
+`SessionManager` holds no cache, so it stays stateless and safe to share across
+concurrent requests. One applicable track costs one lookup per request, so wrap
+`current()` yourself when that is too many:
+
+```ts
+function cached<K>(
+  fn: (key: K) => Promise<number>,
+  ttlMs: number,
+  max = 10_000,
+) {
+  const hit = new Map<K, { value: number; at: number }>();
+  return async (key: K): Promise<number> => {
+    const now = Date.now();
+    const found = hit.get(key);
+    if (found && now - found.at < ttlMs) return found.value;
+    const value = await fn(key);
+    if (hit.size >= max) hit.clear(); // crude, but bounded
+    hit.set(key, { value, at: now });
+    return value;
+  };
+}
+```
+
+The tradeoff is direct: **revocation latency equals the cache TTL.** A 5-second
+TTL means a signed-out user keeps working for up to 5 more seconds. Bound the
+map, or a per-user cache becomes a memory leak keyed by user id.
+
+### Enabling a track logs everyone out, once
+
+Cookies minted before a track existed carry no stamp, and a missing stamp is a
+rejection — there is no way to show such a cookie has not been revoked. So the
+first deploy with `epochTracks` set signs every user out one time. That is
+deliberate: it guarantees every live session is revocable from the moment the
+feature ships, instead of leaving a `ttlSeconds`-long tail of sessions that
+silently cannot be revoked.
+
+Apps that do not set `epochTracks` are completely unaffected — the cookie format
+is unchanged.
+
 ## Caching
 
 Any response whose content depends on the session **must** carry `Vary: Cookie`,
@@ -301,10 +441,10 @@ you. Per-user content should also carry `Cache-Control: private, no-store`.
   base64url plus the nonce, MAC and envelope inflate it by about 1.4x, against a
   ~4096-byte browser limit. `onOversize` warns by default; set it to `"throw"`
   to fail loudly.
-- **There is no server-side revocation.** A captured cookie stays valid until it
-  expires — `destroy()` clears the browser's copy, not an attacker's. Keep
-  `ttlSeconds` short and set `maxSessionAgeSeconds`. For real revocation, store
-  an epoch in the session and compare it against your own store.
+- **Revocation needs an epoch track.** By default a captured cookie stays valid
+  until it expires — `destroy()` clears the browser's copy, not an attacker's.
+  Keep `ttlSeconds` short, set `maxSessionAgeSeconds`, and use
+  [epoch tracks](#revocation-with-epoch-tracks) for immediate revocation.
 - **Rotate on privilege change.** Call `regenerate()` on login,
   logout-then-login, role elevation, and starting or stopping impersonation.
 - **`SameSite=Lax` is not full CSRF protection.** It blocks cross-site POST but

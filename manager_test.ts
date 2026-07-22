@@ -6,9 +6,10 @@ import {
   assertStringIncludes,
   assertThrows,
 } from "@std/assert";
-import { SessionManager } from "./manager.ts";
-import { deriveKey, seal } from "./seal.ts";
+import { SessionManager, type SessionOptions } from "./manager.ts";
+import { deriveKey, seal, unseal } from "./seal.ts";
 import { Session } from "./session.ts";
+import { appEpoch, userEpoch } from "./epoch.ts";
 
 const SECRET = "test-secret-".padEnd(32, "x");
 const SECRET_A = "secret-alpha-".padEnd(40, "a");
@@ -1428,4 +1429,794 @@ Deno.test("a manager stays usable across sequential requests", async () => {
   }
   const final = await m.loadFromCookieHeader(`sid=${cookie}`);
   assertEquals(final.get("uid"), "u3");
+});
+
+// ---------------------------------------------------------------------------
+// Epoch revocation tracks
+// ---------------------------------------------------------------------------
+
+/** Session shape for the epoch tests: a user axis and a tenant axis. */
+type EData = { uid?: string; org?: string };
+
+function emgr(
+  extra: Partial<SessionOptions<EData>> = {},
+): SessionManager<EData> {
+  return new SessionManager<EData>({
+    secret: SECRET,
+    cookieName: "sid",
+    ...extra,
+  });
+}
+
+/** Mint a `Set-Cookie` carrying exactly `data`, always dirtying the session. */
+async function mintWith(
+  manager: SessionManager<EData>,
+  data: EData,
+): Promise<string> {
+  const req = new Request("https://example.com/");
+  const session = await manager.load(req);
+  session.touch();
+  for (const [key, value] of Object.entries(data)) {
+    session.set(key as keyof EData, value);
+  }
+  const setCookie = await manager.persist(session, req);
+  if (!setCookie) throw new Error("expected a Set-Cookie");
+  return setCookie;
+}
+
+/** Load a previously minted `Set-Cookie` back through a manager. */
+function loadCookie(manager: SessionManager<EData>, setCookie: string) {
+  return manager.load(
+    new Request("https://example.com/", {
+      headers: { cookie: pair(setCookie) },
+    }),
+  );
+}
+
+/** The epoch stamp inside a minted cookie, or undefined when there is none. */
+async function stampOf(
+  setCookie: string,
+  secret: string = SECRET,
+): Promise<Record<string, number> | undefined> {
+  const key = await deriveKey(secret, "session");
+  const result = unseal<EData>(cookieValue(setCookie), key, {
+    cookieName: "sid",
+    purpose: "session",
+  });
+  if (!result.ok) throw new Error(result.error);
+  return result.payload.ep;
+}
+
+// --- construction ----------------------------------------------------------
+
+Deno.test("an epoch track with a malformed name throws from the constructor", () => {
+  assertThrows(
+    () => emgr({ epochTracks: [appEpoch<EData>(() => 1, "bad name")] }),
+    TypeError,
+    "epoch track name",
+  );
+});
+
+Deno.test("duplicate epoch track names throw from the constructor", () => {
+  assertThrows(
+    () =>
+      emgr({
+        epochTracks: [
+          appEpoch<EData>(() => 1, "a"),
+          appEpoch<EData>(() => 2, "a"),
+        ],
+      }),
+    TypeError,
+    "duplicate epoch track",
+  );
+});
+
+Deno.test("an epoch track without current() throws from the constructor", () => {
+  assertThrows(
+    () =>
+      emgr({
+        // @ts-expect-error deliberately omitting the required resolver
+        epochTracks: [{ name: "a" }],
+      }),
+    TypeError,
+    "current()",
+  );
+});
+
+Deno.test("an epoch track with a non-function key throws from the constructor", () => {
+  assertThrows(
+    () =>
+      emgr({
+        // @ts-expect-error key must be a function
+        epochTracks: [{ name: "a", key: "uid", current: () => 1 }],
+      }),
+    TypeError,
+    "key",
+  );
+});
+
+Deno.test("a resolver runs neither at construction nor without a cookie", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        calls++;
+        return 1;
+      }),
+    ],
+  });
+  assertEquals(calls, 0);
+  const session = await m.load(new Request("https://example.com/"));
+  assertEquals(session.isNew, true);
+  assertEquals(calls, 0);
+});
+
+// --- app track -------------------------------------------------------------
+
+Deno.test("a cookie stamped at the current app epoch loads unchanged", async () => {
+  const m = emgr({ epochTracks: [appEpoch<EData>(() => 3)] });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  // The stamp is what the next load compares against, so pin it too: a test
+  // that only checks "it loads" would pass with epoch checking removed.
+  assertEquals(await stampOf(setCookie), { a: 3 });
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+});
+
+Deno.test("bumping the app epoch revokes every user at once", async () => {
+  let epoch = 1;
+  const m = emgr({ epochTracks: [appEpoch<EData>(() => epoch)] });
+  const alice = await mintWith(m, { uid: "alice" });
+  const bob = await mintWith(m, { uid: "bob" });
+  epoch = 2;
+
+  const first = await loadCookie(m, alice);
+  assertEquals(first.isInvalid, true);
+  assertEquals(first.invalidReason, "Epoch stale: a");
+
+  const second = await loadCookie(m, bob);
+  assertEquals(second.isInvalid, true);
+  assertEquals(second.invalidReason, "Epoch stale: a");
+  // The revoked session must not leak its identity to the app either.
+  assertEquals(second.get("uid"), undefined);
+});
+
+// --- user track ------------------------------------------------------------
+
+Deno.test("bumping one user's epoch invalidates that user's cookie", async () => {
+  const epochs = new Map<string, number>();
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => epochs.get(uid) ?? 0),
+    ],
+  });
+  const alice = await mintWith(m, { uid: "alice" });
+  epochs.set("alice", 1);
+  const session = await loadCookie(m, alice);
+  assertEquals(session.isInvalid, true);
+  assertEquals(session.invalidReason, "Epoch stale: u");
+});
+
+Deno.test("bumping one user's epoch leaves other users signed in", async () => {
+  const epochs = new Map<string, number>();
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => epochs.get(uid) ?? 0),
+    ],
+  });
+  const alice = await mintWith(m, { uid: "alice" });
+  const bob = await mintWith(m, { uid: "bob" });
+  epochs.set("alice", 1);
+
+  assertEquals((await loadCookie(m, alice)).invalidReason, "Epoch stale: u");
+
+  const other = await loadCookie(m, bob);
+  assertEquals(other.isInvalid, false);
+  assertEquals(other.get("uid"), "bob");
+});
+
+// --- custom track ----------------------------------------------------------
+
+Deno.test("a custom track keyed on org revokes only that org", async () => {
+  const orgs = new Map<string, number>();
+  const m = emgr({
+    epochTracks: [
+      {
+        name: "o",
+        key: (d: EData) => d.org ?? null,
+        current: (key: string | null) => orgs.get(key ?? "") ?? 0,
+      },
+    ],
+  });
+  const acme = await mintWith(m, { uid: "alice", org: "acme" });
+  const globex = await mintWith(m, { uid: "bob", org: "globex" });
+  orgs.set("acme", 4);
+
+  assertEquals((await loadCookie(m, acme)).invalidReason, "Epoch stale: o");
+
+  const untouched = await loadCookie(m, globex);
+  assertEquals(untouched.isInvalid, false);
+  assertEquals(untouched.get("org"), "globex");
+});
+
+// --- several tracks at once ------------------------------------------------
+
+Deno.test("a cookie is stamped for every applicable track", async () => {
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => 2),
+      userEpoch<EData>((d) => d.uid ?? null, () => 5),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  assertEquals(await stampOf(setCookie), { a: 2, u: 5 });
+});
+
+Deno.test("a loaded session exposes the epochs and keys it was validated against", async () => {
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => 2),
+      userEpoch<EData>((d) => d.uid ?? null, () => 5),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  const session = await loadCookie(m, setCookie);
+  // The keys are what stop alice's epoch being restamped onto bob's session.
+  assertEquals(session.epochs, {
+    values: { a: 2, u: 5 },
+    keys: { a: null, u: "alice" },
+  });
+});
+
+Deno.test("staleness on any one of several tracks rejects the session", async () => {
+  const userEpochs = new Map<string, number>();
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => 1),
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => userEpochs.get(uid) ?? 0),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  userEpochs.set("alice", 9);
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, true);
+  assertEquals(session.invalidReason, "Epoch stale: u");
+});
+
+// --- anonymous sessions ----------------------------------------------------
+
+Deno.test("an anonymous session loads fine with a user track configured", async () => {
+  const m = emgr({
+    epochTracks: [userEpoch<EData>((d) => d.uid ?? null, () => 1)],
+  });
+  const setCookie = await mintWith(m, {});
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), undefined);
+});
+
+Deno.test("an anonymous session's cookie carries no user stamp", async () => {
+  const m = emgr({
+    epochTracks: [userEpoch<EData>((d) => d.uid ?? null, () => 1)],
+  });
+  const setCookie = await mintWith(m, {});
+  assertEquals(await stampOf(setCookie), undefined);
+});
+
+Deno.test("an empty-string key skips the track", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        calls++;
+        return 1;
+      }),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "" });
+  assertEquals(await stampOf(setCookie), undefined);
+  assertEquals(calls, 0);
+});
+
+// --- login mid-request -----------------------------------------------------
+
+Deno.test("logging in mid-request stamps the new user's epoch", async () => {
+  const epochs = new Map<string, number>([["bob", 7]]);
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => epochs.get(uid) ?? 0),
+    ],
+  });
+  const anon = await mintWith(m, {});
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(anon) },
+  });
+  const session = await m.load(req);
+  session.set("uid", "bob");
+  const setCookie = await m.persist(session, req);
+  assertEquals(await stampOf(setCookie!), { u: 7 });
+});
+
+Deno.test("the cookie minted at login loads cleanly afterwards", async () => {
+  const epochs = new Map<string, number>([["bob", 7]]);
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => epochs.get(uid) ?? 0),
+    ],
+  });
+  const anon = await mintWith(m, {});
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(anon) },
+  });
+  const session = await m.load(req);
+  session.set("uid", "bob");
+  const setCookie = await m.persist(session, req);
+
+  const back = await loadCookie(m, setCookie!);
+  assertEquals(back.isInvalid, false);
+  assertEquals(back.get("uid"), "bob");
+});
+
+Deno.test("regenerate then set(uid) stamps the new identity", async () => {
+  const epochs = new Map<string, number>([["alice", 1], ["bob", 4]]);
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => epochs.get(uid) ?? 0),
+    ],
+  });
+  const alice = await mintWith(m, { uid: "alice" });
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(alice) },
+  });
+  const session = await m.load(req);
+  session.regenerate();
+  session.set("uid", "bob");
+  const setCookie = await m.persist(session, req);
+  assertEquals(await stampOf(setCookie!), { u: 4 });
+
+  const back = await loadCookie(m, setCookie!);
+  assertEquals(back.isInvalid, false);
+  assertEquals(back.get("uid"), "bob");
+});
+
+// --- missing stamps --------------------------------------------------------
+
+Deno.test("a cookie minted without tracks is rejected once tracks exist", async () => {
+  const plain = emgr();
+  const setCookie = await mintWith(plain, { uid: "alice" });
+  const tracked = emgr({ epochTracks: [appEpoch<EData>(() => 0)] });
+  const session = await loadCookie(tracked, setCookie);
+  assertEquals(session.isInvalid, true);
+  assertEquals(session.invalidReason, "Epoch missing: a");
+});
+
+Deno.test("an untracked manager is unaffected by the missing stamp", async () => {
+  const plain = emgr();
+  const setCookie = await mintWith(plain, { uid: "alice" });
+  const session = await loadCookie(plain, setCookie);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+});
+
+// --- resolver failure ------------------------------------------------------
+
+Deno.test("a throwing resolver rejects the session by default", async () => {
+  let boom = false;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  boom = true;
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, true);
+  assertEquals(session.invalidReason, "Epoch unavailable: a");
+});
+
+Deno.test("a resolver returning a non-number rejects the session", async () => {
+  let broken = false;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => (broken ? ("nope" as unknown as number) : 1)),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  broken = true;
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.invalidReason, "Epoch unavailable: a");
+});
+
+Deno.test("a resolver returning NaN rejects the session", async () => {
+  let broken = false;
+  const m = emgr({
+    epochTracks: [appEpoch<EData>(() => (broken ? NaN : 1))],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  broken = true;
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.invalidReason, "Epoch unavailable: a");
+});
+
+Deno.test('onEpochError returning "allow" lets the session load', async () => {
+  let boom = false;
+  const seen: string[] = [];
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+    onEpochError: (info) => {
+      seen.push(info.track);
+      return "allow";
+    },
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  boom = true;
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+  assertEquals(seen, ["a"]);
+});
+
+Deno.test("onEpochError receives the track, key and request", async () => {
+  let boom = false;
+  const seen: { track: string; key: string | null; request?: Request }[] = [];
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+    onEpochError: (info) => {
+      seen.push({ track: info.track, key: info.key, request: info.request });
+      return "allow";
+    },
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  boom = true;
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(setCookie) },
+  });
+  await m.load(req);
+  assertEquals(seen.length, 1);
+  assertEquals(seen[0].track, "u");
+  assertEquals(seen[0].key, "alice");
+  assertEquals(seen[0].request, req);
+});
+
+Deno.test("an onEpochError that throws propagates out of load", async () => {
+  let boom = false;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+    onEpochError: () => {
+      throw new Error("epoch policy exploded");
+    },
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  boom = true;
+  await assertRejects(
+    () => loadCookie(m, setCookie),
+    Error,
+    "epoch policy exploded",
+  );
+});
+
+// --- lagging replicas ------------------------------------------------------
+
+Deno.test("a resolver lagging behind the stamp still accepts the session", async () => {
+  let epoch = 5;
+  const m = emgr({ epochTracks: [appEpoch<EData>(() => epoch)] });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  epoch = 2;
+  const session = await loadCookie(m, setCookie);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+});
+
+// --- onInvalid -------------------------------------------------------------
+
+Deno.test("onInvalid reports the epoch reason", async () => {
+  let epoch = 1;
+  const seen: string[] = [];
+  const m = emgr({
+    epochTracks: [appEpoch<EData>(() => epoch)],
+    onInvalid: (info) => seen.push(info.reason),
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  epoch = 2;
+  await loadCookie(m, setCookie);
+  assertEquals(seen, ["Epoch stale: a"]);
+});
+
+// --- resolution ordering vs planted cookies --------------------------------
+
+Deno.test("planted junk cookies never reach the epoch resolver", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        calls++;
+        return 1;
+      }),
+    ],
+  });
+  const header = Array.from({ length: 20 }, (_, i) => `sid=junk${i}`).join(
+    "; ",
+  );
+  const session = await m.loadFromCookieHeader(header);
+  assertEquals(session.isInvalid, true);
+  assertEquals(calls, 0);
+});
+
+Deno.test("one junk cookie beside a valid one still loads with epochs", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        calls++;
+        return 1;
+      }),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  calls = 0;
+  const session = await m.loadFromCookieHeader(
+    `sid=junk; ${pair(setCookie)}`,
+  );
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+  assertEquals(calls, 1);
+});
+
+Deno.test("a stale cookie beside a fresh one falls through to the fresh session", async () => {
+  let epoch = 1;
+  const m = emgr({ epochTracks: [appEpoch<EData>(() => epoch)] });
+  const stale = await mintWith(m, { uid: "alice" });
+  epoch = 2;
+  const fresh = await mintWith(m, { uid: "bob" });
+
+  const session = await m.loadFromCookieHeader(
+    `${pair(stale)}; ${pair(fresh)}`,
+  );
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "bob");
+});
+
+// --- persist reuse ---------------------------------------------------------
+
+Deno.test("an unchanged key resolves a track once across load and persist", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        calls++;
+        return 3;
+      }),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  calls = 0;
+
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(setCookie) },
+  });
+  const session = await m.load(req);
+  session.touch();
+  const reissued = await m.persist(session, req);
+
+  assertEquals(calls, 1);
+  assertEquals(await stampOf(reissued!), { u: 3 });
+});
+
+Deno.test("a changed key re-resolves the track on persist", async () => {
+  const epochs = new Map<string, number>([["alice", 1], ["bob", 6]]);
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, (uid) => {
+        calls++;
+        return epochs.get(uid) ?? 0;
+      }),
+    ],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+  calls = 0;
+
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(setCookie) },
+  });
+  const session = await m.load(req);
+  session.set("uid", "bob");
+  const reissued = await m.persist(session, req);
+
+  assertEquals(calls, 2);
+  assertEquals(await stampOf(reissued!), { u: 6 });
+});
+
+Deno.test("a write-path resolver failure propagates with no error policy", async () => {
+  // Nothing can be stamped, and an unstamped cookie is rejected on the very
+  // next load, so persist must fail loudly rather than mint one.
+  let boom = false;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+  });
+  const anon = await mintWith(m, {});
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(anon) },
+  });
+  const session = await m.load(req);
+  session.set("uid", "bob");
+  boom = true;
+  await assertRejects(
+    () => m.persist(session, req),
+    Error,
+    "Epoch unavailable: u",
+  );
+});
+
+Deno.test("a login during an outage throws rather than minting an unstamped cookie", async () => {
+  // There is no prior stamp to preserve for a brand-new identity, so "allow"
+  // cannot save this one: minting an unstamped cookie would log the user out on
+  // their next request instead, silently. Fail at the moment of failure.
+  let boom = false;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        if (boom) throw new Error("store down");
+        return 1;
+      }),
+    ],
+    onEpochError: () => "allow",
+  });
+  const anon = await mintWith(m, {});
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(anon) },
+  });
+  const session = await m.load(req);
+  session.set("uid", "bob");
+  boom = true;
+
+  await assertRejects(
+    () => m.persist(session, req),
+    Error,
+    "Epoch unavailable",
+  );
+});
+
+Deno.test('an existing session under "allow" keeps its stamp through an outage', async () => {
+  // The point of "allow": a session that already carries a stamp goes on
+  // working, and a re-seal preserves that stamp rather than dropping it.
+  let boom = false;
+  const m = emgr({
+    epochTracks: [
+      userEpoch<EData>((d) => d.uid ?? null, () => {
+        if (boom) throw new Error("store down");
+        return 7;
+      }),
+    ],
+    onEpochError: () => "allow",
+    rolling: true,
+  });
+  const alice = await mintWith(m, { uid: "alice" });
+  assertEquals(await stampOf(alice), { u: 7 });
+
+  boom = true;
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(alice) },
+  });
+  const session = await m.load(req);
+  assertEquals(session.isInvalid, false);
+  assertEquals(session.get("uid"), "alice");
+
+  // rolling re-seals every request; the stamp must survive it.
+  const reissued = await m.persist(session, req);
+  assertEquals(await stampOf(reissued!), { u: 7 });
+
+  // ...and once the store recovers the session is still valid, not "missing".
+  boom = false;
+  const back = await loadCookie(m, reissued!);
+  assertEquals(back.isInvalid, false);
+  assertEquals(back.get("uid"), "alice");
+});
+
+// --- interaction with other features ---------------------------------------
+
+Deno.test("epochs are checked on a cookie sealed under a rotated-out secret", async () => {
+  let epoch = 1;
+  const tracks = () => [appEpoch<EData>(() => epoch)];
+  const old = new SessionManager<EData>({
+    secret: SECRET_B,
+    cookieName: "sid",
+    epochTracks: tracks(),
+  });
+  const setCookie = await mintWith(old, { uid: "alice" });
+
+  const rotating = new SessionManager<EData>({
+    secret: [SECRET_A, SECRET_B],
+    cookieName: "sid",
+    epochTracks: tracks(),
+  });
+  epoch = 2;
+  const session = await loadCookie(rotating, setCookie);
+  assertEquals(session.isInvalid, true);
+  assertEquals(session.invalidReason, "Epoch stale: a");
+});
+
+Deno.test("a rotated-in cookie keeps a valid epoch stamp", async () => {
+  const old = new SessionManager<EData>({
+    secret: SECRET_B,
+    cookieName: "sid",
+    epochTracks: [appEpoch<EData>(() => 1)],
+  });
+  const setCookie = await mintWith(old, { uid: "alice" });
+
+  const rotating = new SessionManager<EData>({
+    secret: [SECRET_A, SECRET_B],
+    cookieName: "sid",
+    epochTracks: [appEpoch<EData>(() => 1)],
+  });
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(setCookie) },
+  });
+  const session = await rotating.load(req);
+  assertEquals(session.isDirty, true);
+  const reminted = await rotating.persist(session, req);
+  assertEquals(await stampOf(reminted!, SECRET_A), { a: 1 });
+});
+
+Deno.test("rolling re-issues a cookie that keeps its epoch stamp", async () => {
+  let epoch = 2;
+  const m = emgr({
+    rolling: true,
+    epochTracks: [appEpoch<EData>(() => epoch)],
+  });
+  const setCookie = await mintWith(m, { uid: "alice" });
+
+  const req = new Request("https://example.com/", {
+    headers: { cookie: pair(setCookie) },
+  });
+  const session = await m.load(req);
+  assertEquals(session.isDirty, true);
+  const reissued = await m.persist(session, req);
+  assertEquals(await stampOf(reissued!), { a: 2 });
+
+  epoch = 3;
+  const stale = await loadCookie(m, reissued!);
+  assertEquals(stale.invalidReason, "Epoch stale: a");
+});
+
+Deno.test("a destroyed session clears the cookie without resolving epochs", async () => {
+  let calls = 0;
+  const m = emgr({
+    epochTracks: [
+      appEpoch<EData>(() => {
+        calls++;
+        return 1;
+      }),
+    ],
+  });
+  const req = new Request("https://example.com/");
+  const session = await m.load(req);
+  session.destroy();
+  const cleared = await m.persist(session, req);
+  assertStringIncludes(cleared!, "Max-Age=0");
+  assertEquals(calls, 0);
 });

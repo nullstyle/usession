@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **Epoch revocation tracks.** A sealed cookie could not previously be revoked;
+  the docs told you to hand-roll an epoch and check it yourself. That is now a
+  feature, generalized to independent named tracks so one session can be revoked
+  along several axes at once:
+  - `appEpoch(current)` — bump one number to sign everyone out.
+  - `userEpoch(keyOf, current)` — sign one user out everywhere, for a password
+    change, without touching anyone else.
+  - any `EpochTrack` object — a suspended tenant, a permission-model change, a
+    device family, a session-schema version.
+
+  Configure with `epochTracks`. The epoch is stamped into the cookie on write
+  and re-checked on read (`stored < current` rejects), so revocation is
+  immediate. The library stores nothing: `current()` is yours, and where epochs
+  live and how they advance stays entirely with your app.
+- `onEpochError` — policy when a resolver fails or returns a non-number. Omit it
+  to fail closed (the session is rejected); return `"allow"` to keep serving
+  with that track unchecked; throw to fail the request loudly. Under `"allow"`
+  an existing session carries its stamp forward and survives the outage intact;
+  a fresh login throws instead, because an unstamped cookie would be rejected on
+  the next request and log the user out silently.
+- `session.invalidReason` now distinguishes `Epoch stale: <track>`,
+  `Epoch missing: <track>` and `Epoch unavailable: <track>`.
+- `ISession.epochs` exposes the epochs a session was admitted under, so a
+  re-seal restamps without a second lookup when the track's key has not changed.
+
+### ⚠️ Breaking, but only if you enable a track
+
+Apps that do not set `epochTracks` are completely unaffected — the cookie format
+is unchanged and there is no token version bump.
+
+Apps that do opt in sign every user out **once**, on the first deploy: cookies
+minted before a track existed carry no stamp, and a missing stamp is a rejection
+because such a cookie cannot be shown to be un-revoked. This is deliberate — it
+guarantees every live session is revocable from the moment the feature ships,
+rather than leaving a `ttlSeconds`-long tail of sessions that silently cannot
+be.
+
+### Notes
+
+- Epoch resolution runs only after a cookie authenticates, so a client planting
+  duplicate junk cookies cannot force lookups against your epoch store.
+- `SessionManager` still holds no cache and stays safe to share across
+  concurrent requests. The README has a copyable TTL-memo recipe, and is
+  explicit that revocation latency then equals the cache TTL.
+
 ## 0.2.0
 
 A security and correctness pass over the whole library, following a full audit

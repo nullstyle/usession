@@ -86,12 +86,35 @@ export interface ISession<T extends object = DefaultSessionData> {
   readonly iat0: number | undefined;
 
   /**
+   * Revocation epochs validated when this session was loaded, keyed by track
+   * name, together with the key each was resolved under.
+   *
+   * Read by `SessionManager.serialize` so a re-seal can restamp without a
+   * second store lookup, and skipped when the track's key has changed (a login
+   * mid-request). `undefined` on a session that was never loaded from a cookie.
+   */
+  readonly epochs: EpochState | undefined;
+
+  /**
    * Clear the dirty flag after a successful persist.
    *
    * Called by `SessionManager.persist`; not part of normal application use.
    */
   markPersisted(): void;
 }
+
+/**
+ * Epoch values carried by a loaded session, with the keys they belong to.
+ *
+ * The keys matter: an epoch resolved for user `alice` must not be restamped
+ * onto a session that has since logged in as `bob`.
+ */
+export type EpochState = {
+  /** Track name to the epoch validated at load. */
+  values: Record<string, number>;
+  /** Track name to the key that epoch was resolved under, `null` if global. */
+  keys: Record<string, string | null>;
+};
 
 /** Options for the {@linkcode Session} constructor. */
 export type SessionInit = {
@@ -105,6 +128,8 @@ export type SessionInit = {
   flash?: Record<string, string>;
   /** Session birth time in unix seconds, carried forward across re-seals. */
   iat0?: number;
+  /** Revocation epochs validated at load, with the keys they belong to. */
+  epochs?: EpochState;
 };
 
 /**
@@ -122,6 +147,7 @@ export class Session<T extends object = DefaultSessionData>
   #isDestroyed: boolean;
   #invalidReason: string | undefined;
   #iat0: number | undefined;
+  #epochs: EpochState | undefined;
 
   /**
    * Construct a session around an existing data object.
@@ -141,6 +167,7 @@ export class Session<T extends object = DefaultSessionData>
     this.#isDestroyed = false;
     this.#invalidReason = init.invalidReason;
     this.#iat0 = init.iat0;
+    this.#epochs = init.epochs;
   }
 
   /** {@inheritDoc ISession.data} */
@@ -181,6 +208,11 @@ export class Session<T extends object = DefaultSessionData>
    */
   get iat0(): number | undefined {
     return this.#iat0;
+  }
+
+  /** {@inheritDoc ISession.epochs} */
+  get epochs(): EpochState | undefined {
+    return this.#epochs;
   }
 
   /** Throw if the session has been destroyed. */
@@ -343,6 +375,9 @@ export class Session<T extends object = DefaultSessionData>
     this.#isInvalid = false;
     this.#invalidReason = undefined;
     this.#iat0 = undefined;
+    // Drop the cached epochs too: this is a different session now, possibly a
+    // different user, so persist must resolve fresh values for it.
+    this.#epochs = undefined;
     this.#isDirty = true;
   }
 

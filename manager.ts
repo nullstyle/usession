@@ -18,7 +18,22 @@ import {
   type Secret,
   unseal,
 } from "./seal.ts";
-import { type DefaultSessionData, type ISession, Session } from "./session.ts";
+import {
+  type DefaultSessionData,
+  type EpochState,
+  type ISession,
+  Session,
+} from "./session.ts";
+import {
+  applicableTracks,
+  assertValidTracks,
+  type EpochContext,
+  type EpochErrorAction,
+  type EpochErrorInfo,
+  type EpochTrack,
+  EpochUnavailable,
+  resolveEpoch,
+} from "./epoch.ts";
 
 /** Default session lifetime: 7 days. */
 const DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 7;
@@ -130,6 +145,24 @@ export type SessionOptions<T extends object = DefaultSessionData> = {
   trustProxy?: boolean;
   /** Whether to delete a cookie that failed to unseal. Defaults to `"clear"`. */
   onInvalidCookie?: "ignore" | "clear";
+  /**
+   * Revocation tracks. See {@linkcode EpochTrack}, {@linkcode appEpoch} and
+   * {@linkcode userEpoch}.
+   *
+   * Each track stamps a number into the cookie on write and re-checks it on
+   * read, so advancing the number invalidates every session on that track
+   * immediately. Sessions written before a track was configured carry no stamp
+   * and are rejected, so enabling a track logs out everyone once.
+   */
+  epochTracks?: EpochTrack<T>[];
+  /**
+   * What to do when a track's `current()` fails or returns a non-number.
+   *
+   * Omit to fail closed — the session is rejected, which is safe but means an
+   * outage in your epoch store logs everyone out. Return `"allow"` to let the
+   * request through with that track unchecked. Throwing from here propagates.
+   */
+  onEpochError?: (info: EpochErrorInfo) => EpochErrorAction;
 };
 
 /** Request facts the manager needs, for the framework-agnostic entry points. */
@@ -154,6 +187,8 @@ type ResolvedOptions = {
   bindHost: boolean;
   trustProxy: boolean;
   onInvalidCookie: "ignore" | "clear";
+  epochTracks: readonly EpochTrack<object>[];
+  onEpochError: ((info: EpochErrorInfo) => EpochErrorAction) | undefined;
   cookie:
     & Required<Omit<SessionCookieOptions, "maxAge" | "expires" | "domain">>
     & { domain?: string };
@@ -259,6 +294,8 @@ function resolveOptions(opts: SessionOptions<object>): ResolvedOptions {
     bindHost: opts.bindHost ?? false,
     trustProxy: opts.trustProxy ?? false,
     onInvalidCookie: opts.onInvalidCookie ?? "clear",
+    epochTracks: opts.epochTracks ?? [],
+    onEpochError: opts.onEpochError,
     cookie: {
       path,
       domain: opts.cookie?.domain,
@@ -394,6 +431,7 @@ export class SessionManager<T extends object = DefaultSessionData> {
 
     this.#resolved = resolveOptions(options as SessionOptions<object>);
     assertPrefixInvariants(this.#resolved, options.cookie?.secure);
+    assertValidTracks(this.#resolved.epochTracks);
     this.#secrets = secrets;
   }
 
@@ -443,6 +481,142 @@ export class SessionManager<T extends object = DefaultSessionData> {
       cookieName: this.#resolved.cookieName,
       request,
     });
+  }
+
+  /**
+   * Validate a decrypted payload's revocation epochs.
+   *
+   * Every applicable track must carry a stamp that is at least the current
+   * value. A missing stamp is a rejection: a cookie minted before a track was
+   * configured cannot be shown to be un-revoked, so enabling a track logs
+   * everyone out exactly once.
+   *
+   * Comparison is `stored < current`, not `!==`, so a lagging read replica
+   * returning an older number fails open on that axis rather than logging out
+   * every user at once.
+   */
+  async #checkEpochs(
+    data: T,
+    stamped: Record<string, number> | undefined,
+    request: Request | undefined,
+  ): Promise<
+    { ok: true; state: EpochState | undefined } | { ok: false; error: string }
+  > {
+    const o = this.#resolved;
+    if (o.epochTracks.length === 0) return { ok: true, state: undefined };
+
+    const tracks = applicableTracks(
+      o.epochTracks as readonly EpochTrack<T>[],
+      data,
+    );
+    if (tracks.length === 0) return { ok: true, state: undefined };
+
+    const ctx: EpochContext = { request, cookieName: o.cookieName };
+
+    let resolved: Array<number | null>;
+    try {
+      resolved = await Promise.all(
+        tracks.map(({ track, key }) =>
+          resolveEpoch(track, key, ctx, o.onEpochError)
+        ),
+      );
+    } catch (e) {
+      if (e instanceof EpochUnavailable) return { ok: false, error: e.message };
+      throw e;
+    }
+
+    const state: EpochState = { values: {}, keys: {} };
+
+    for (let i = 0; i < tracks.length; i++) {
+      const { track, key } = tracks[i];
+      const current = resolved[i];
+
+      if (current === null) {
+        // The error policy allowed this track to go unchecked. Carry the stamp
+        // this cookie already had forward, so a re-seal preserves it: dropping
+        // it would make the next load reject the session as missing, which is
+        // the exact opposite of what "allow" is supposed to buy.
+        const carried = stamped?.[track.name];
+        if (typeof carried === "number" && Number.isFinite(carried)) {
+          state.values[track.name] = carried;
+          state.keys[track.name] = key;
+        }
+        continue;
+      }
+
+      const value = stamped?.[track.name];
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        return { ok: false, error: `Epoch missing: ${track.name}` };
+      }
+      if (value < current) {
+        return { ok: false, error: `Epoch stale: ${track.name}` };
+      }
+
+      state.values[track.name] = current;
+      state.keys[track.name] = key;
+    }
+
+    return { ok: true, state };
+  }
+
+  /**
+   * Build the epoch stamp for a session about to be sealed.
+   *
+   * Reuses the value validated at load when the track's key has not changed —
+   * that is the same epoch this session was just admitted under, and it saves a
+   * second lookup. A changed key (the login case, where `uid` went from absent
+   * to a real id) forces a fresh resolve.
+   *
+   * A resolver failure is never simply swallowed here. Under
+   * `onEpochError: "allow"` an existing session keeps the stamp it arrived
+   * with, so it goes on working through an outage; but a session with nothing
+   * to preserve — a fresh login, or a track whose key just changed — throws,
+   * because minting an unstamped cookie would log the user out on the very next
+   * request instead, with nothing surfaced to the app. You cannot mint what you
+   * cannot stamp.
+   */
+  async #stampEpochs(
+    data: T,
+    previous: EpochState | undefined,
+    request: Request | undefined,
+  ): Promise<Record<string, number> | undefined> {
+    const o = this.#resolved;
+    if (o.epochTracks.length === 0) return undefined;
+
+    const tracks = applicableTracks(
+      o.epochTracks as readonly EpochTrack<T>[],
+      data,
+    );
+    if (tracks.length === 0) return undefined;
+
+    const ctx: EpochContext = { request, cookieName: o.cookieName };
+    const stamp: Record<string, number> = {};
+
+    await Promise.all(tracks.map(async ({ track, key }) => {
+      // Only reuse a value that belongs to this same key: an epoch resolved for
+      // alice must not be restamped onto a session that has since become bob.
+      const carried = previous?.keys[track.name] === key
+        ? previous?.values[track.name]
+        : undefined;
+
+      if (carried !== undefined) {
+        stamp[track.name] = carried;
+        return;
+      }
+
+      const current = await resolveEpoch(track, key, ctx, o.onEpochError);
+      if (current === null) {
+        // Policy allowed the failure, but there is no prior stamp to preserve,
+        // so any cookie we mint now would be rejected as missing next request.
+        throw new EpochUnavailable(
+          track.name,
+          new Error("no prior epoch to preserve"),
+        );
+      }
+      stamp[track.name] = current;
+    }));
+
+    return Object.keys(stamp).length > 0 ? stamp : undefined;
   }
 
   #invalidSession(reason: string, request: Request | undefined): Session<T> {
@@ -534,10 +708,24 @@ export class SessionManager<T extends object = DefaultSessionData> {
           continue;
         }
 
+        // Epoch checks run here, *below* unseal, so they only ever fire for a
+        // cookie that already authenticated. A client planting N junk cookies
+        // therefore cannot force N lookups against your epoch store.
+        const epochCheck = await this.#checkEpochs(
+          data,
+          result.payload.ep,
+          req,
+        );
+        if (!epochCheck.ok) {
+          lastError = epochCheck.error;
+          continue;
+        }
+
         const session = new Session<T>(data, {
           isNew: false,
           flash: result.payload.flash,
           iat0: result.payload.iat0,
+          epochs: epochCheck.state,
         });
 
         // Re-issue under the primary key so a rotated-out secret drains.
@@ -639,6 +827,7 @@ export class SessionManager<T extends object = DefaultSessionData> {
 
     if (session.isDirty) {
       const keys = await this.#getKeys();
+      const epochs = await this.#stampEpochs(session.data, session.epochs, req);
       const token = seal(session.data, keys[0], {
         cookieName: o.cookieName,
         purpose: o.purpose,
@@ -646,6 +835,7 @@ export class SessionManager<T extends object = DefaultSessionData> {
         ttlSeconds: o.ttlSeconds,
         iat0: session.iat0,
         flash: session.peekFlash(),
+        epochs,
       });
 
       const setCookie = serializeCookie(o.cookieName, token, {

@@ -98,10 +98,21 @@ export {
 // Session
 export {
   type DefaultSessionData,
+  type EpochState,
   type ISession,
   Session,
   type SessionInit,
 } from "./session.ts";
+
+// Revocation tracks
+export {
+  appEpoch,
+  type EpochContext,
+  type EpochErrorAction,
+  type EpochErrorInfo,
+  type EpochTrack,
+  userEpoch,
+} from "./epoch.ts";
 
 // Manager
 export {

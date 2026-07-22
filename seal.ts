@@ -79,6 +79,14 @@ export type SealedPayload<T> = {
    * inside it so the library never squats on an application key.
    */
   flash?: Record<string, string>;
+  /**
+   * Epoch each revocation track had when this cookie was written, keyed by
+   * track name. Compared against the current values on load — see `epoch.ts`.
+   *
+   * The comparison itself is asynchronous (it may hit a store), so it lives in
+   * `SessionManager` rather than in {@linkcode unseal}, which stays pure.
+   */
+  ep?: Record<string, number>;
 };
 
 /** Options for {@linkcode seal}. */
@@ -95,6 +103,8 @@ export type SealOptions = {
   iat0?: number;
   /** Flash messages to carry. */
   flash?: Record<string, string>;
+  /** Revocation epochs to stamp, keyed by track name. */
+  epochs?: Record<string, number>;
 };
 
 /** Options for {@linkcode unseal}. */
@@ -235,6 +245,9 @@ export function seal<T>(
     data,
     ...(opts.flash && Object.keys(opts.flash).length > 0
       ? { flash: opts.flash }
+      : {}),
+    ...(opts.epochs && Object.keys(opts.epochs).length > 0
+      ? { ep: opts.epochs }
       : {}),
   };
 

@@ -44,10 +44,11 @@ cannot defend against.
 
 ### What it does not protect
 
-- **Revocation.** A sealed cookie is valid until it expires. Logging out clears
-  the cookie in the browser but cannot invalidate a copy an attacker already
-  captured. Keep `ttlSeconds` short, set `maxSessionAgeSeconds`, and store a
-  server-checked epoch in the session if you need real revocation.
+- **Revocation, unless you configure it.** By default a sealed cookie is valid
+  until it expires: logging out clears the browser's copy but cannot invalidate
+  a copy an attacker already captured. Configure `epochTracks` for immediate
+  revocation — per app, per user, or on any axis you choose — and keep
+  `ttlSeconds` short with `maxSessionAgeSeconds` set as a backstop.
 - **A leaked secret.** Anyone holding the secret can mint a session for any
   user. Rotate with the array form of `secret` (see the README) and treat the
   secret as the highest-value key in your system.
@@ -65,3 +66,7 @@ cannot defend against.
   _overwrites_ `X-Forwarded-*`) or `cookie: { secure: true }`.
 - Use a `__Host-` cookie name in production.
 - Give every service that shares a secret its own `purpose`.
+- Configure at least a user `epochTrack` if you need password changes or "sign
+  out everywhere" to take effect before the session expires. Note that a failing
+  epoch resolver rejects sessions by default; override with `onEpochError` only
+  if you would rather stay available than stay revocable during an outage.
