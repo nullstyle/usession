@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Format
+        run: deno fmt --check
+
+      - name: Lint
+        run: deno lint
+
+      - name: Type check
+        run: deno check **/*.ts
+
+      - name: Doc lint
+        run: deno doc --lint mod.ts
+
+      - name: Doc examples
+        run: deno test --doc --no-run
+
+      - name: Test
+        run: deno test -A
+
+      - name: Publish dry run
+        run: deno publish --dry-run
+
+      # The library must stay runtime agnostic: no Deno.* API calls outside
+      # tests. Doc comments may reference Deno.env, and the customInspect
+      # symbol is a plain string that is inert on other runtimes.
+      - name: Portability fence
+        run: |
+          if grep -rn '\bDeno\.' --include='*.ts' . \
+            | grep -v '_test\.ts' \
+            | grep -v '^\./\.git' \
+            | grep -vE '^[^:]*:[0-9]+: *(\*|//|/\*)' \
+            | grep -v 'Symbol\.for("Deno\.customInspect")'; then
+            echo "::error::Deno.* API used outside test files"
+            exit 1
+          fi

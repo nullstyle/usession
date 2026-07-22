@@ -1,0 +1,28 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Required for tokenless OIDC publishing to JSR.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Test
+        run: deno test -A
+
+      # No --allow-dirty: publishing must reflect exactly what is committed.
+      - name: Publish to JSR
+        run: deno publish
